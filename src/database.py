@@ -1,59 +1,59 @@
 """
-database.py — Local SQLite database module for CAA-2.
+database.py — Supabase PostgreSQL database module for CAA-3.
+
+Connects to Supabase PostgreSQL via DATABASE_URL environment variable.
+Table public.ohlcv_5m must already exist on the cloud database.
 
 Provides:
-    init_db(db_path)                          → create DB file + ohlcv_5m table
+    get_connection()                          → open psycopg Connection
     upsert_candles(conn, candles, exchange,
                    symbol, timeframe)         → insert or update candle records
     get_latest_timestamp(conn, exchange,
                          symbol, timeframe)   → latest timestamp in DB for a market
 """
 
-import sqlite3
 import os
 
-# ------------------------------------------------------------------
-# DDL (Data Definition Language — ngôn ngữ định nghĩa cấu trúc DB)
-# ------------------------------------------------------------------
-_CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS ohlcv_5m (
-    id        INTEGER  PRIMARY KEY AUTOINCREMENT,
-    exchange  TEXT     NOT NULL,
-    symbol    TEXT     NOT NULL,
-    timeframe TEXT     NOT NULL,
-    timestamp INTEGER  NOT NULL,
-    open      REAL     NOT NULL,
-    high      REAL     NOT NULL,
-    low       REAL     NOT NULL,
-    close     REAL     NOT NULL,
-    volume    REAL     NOT NULL,
-    is_closed INTEGER  NOT NULL DEFAULT 0,
+import psycopg
 
-    UNIQUE (exchange, symbol, timeframe, timestamp)
-);
-"""
+from dotenv import load_dotenv
 
-# UPSERT logic:
+# Load .env file from project root (contains DATABASE_URL).
+# .env is gitignored — secrets are never committed.
+load_dotenv()
+
+# ------------------------------------------------------------------
+# UPSERT SQL for PostgreSQL
+# ------------------------------------------------------------------
+#
+# UPSERT logic (unchanged from CAA-2):
 #   - INSERT new record if (exchange, symbol, timeframe, timestamp) not seen before.
-#   - DO UPDATE only when existing record is still OPEN (is_closed = 0).
+#   - DO UPDATE only when existing record is still OPEN (is_closed = FALSE).
 #     This covers both:
 #       OPEN → OPEN   : update latest OHLCV during candle formation
 #       OPEN → CLOSED : mark candle as closed with final OHLCV
-#   - If existing is already CLOSED (is_closed = 1), skip — historical data is immutable.
+#   - If existing is already CLOSED (is_closed = TRUE), skip —
+#     historical data is immutable.
+#
+# PostgreSQL differences from SQLite:
+#   - Placeholders: %s instead of ?
+#   - is_closed: BOOLEAN (TRUE/FALSE) instead of INTEGER (0/1)
+#   - EXCLUDED keyword (PostgreSQL convention, case-insensitive)
+#
 _UPSERT_SQL = """
 INSERT INTO ohlcv_5m
     (exchange, symbol, timeframe, timestamp,
      open, high, low, close, volume, is_closed)
 VALUES
-    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 ON CONFLICT (exchange, symbol, timeframe, timestamp)
 DO UPDATE SET
-    high      = excluded.high,
-    low       = excluded.low,
-    close     = excluded.close,
-    volume    = excluded.volume,
-    is_closed = excluded.is_closed
-WHERE ohlcv_5m.is_closed = 0;
+    high      = EXCLUDED.high,
+    low       = EXCLUDED.low,
+    close     = EXCLUDED.close,
+    volume    = EXCLUDED.volume,
+    is_closed = EXCLUDED.is_closed
+WHERE ohlcv_5m.is_closed = FALSE;
 """
 
 
@@ -61,38 +61,40 @@ WHERE ohlcv_5m.is_closed = 0;
 # Public API
 # ------------------------------------------------------------------
 
-def init_db(db_path: str) -> sqlite3.Connection:
+def get_connection() -> psycopg.Connection:
     """
-    Create the SQLite database file and ohlcv_5m table if they don't exist.
+    Open a connection to Supabase PostgreSQL using DATABASE_URL.
 
-    Args:
-        db_path: Path to the .db file (e.g. 'db/local.db').
-                 Parent directory is created automatically if missing.
+    The DATABASE_URL environment variable must be set (typically via .env).
+    It contains the full PostgreSQL connection string including SSL mode.
+    The password is never printed or logged.
 
     Returns:
-        An open sqlite3.Connection with row_factory set to Row for
-        dict-like column access.
+        An open psycopg.Connection ready for queries.
+
+    Raises:
+        RuntimeError if DATABASE_URL is not set.
+        psycopg.OperationalError on connection failure.
 
     Notes:
-        - Safe to call multiple times; CREATE TABLE IF NOT EXISTS is idempotent.
-        - Existing data is never deleted.
+        - Table ohlcv_5m must already exist on Supabase (created via SQL Editor).
+        - Safe to call multiple times; each call opens a new connection.
+        - Caller is responsible for closing the connection.
     """
-    parent = os.path.dirname(db_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        raise RuntimeError(
+            "DATABASE_URL environment variable is not set. "
+            "Create a .env file with DATABASE_URL=postgresql://... "
+            "or set the variable in your shell."
+        )
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row          # row_factory: truy cập column bằng tên
-    conn.execute("PRAGMA journal_mode=WAL") # WAL mode: cải thiện concurrent reads
-    conn.execute("PRAGMA foreign_keys=ON")
-
-    conn.execute(_CREATE_TABLE_SQL)
-    conn.commit()
+    conn = psycopg.connect(dsn)
     return conn
 
 
 def upsert_candles(
-    conn: sqlite3.Connection,
+    conn: psycopg.Connection,
     candles: list[dict],
     exchange: str,
     symbol: str,
@@ -108,49 +110,54 @@ def upsert_candles(
         low        (float) : lowest price in period
         close      (float) : closing price (may change while candle is open)
         volume     (float) : traded volume
-        is_closed  (int)   : 0 = candle still forming, 1 = candle confirmed closed
+        is_closed  (int|bool) : 0/False = candle still forming,
+                                1/True  = candle confirmed closed
 
     UPSERT rules:
         - New timestamp → INSERT
-        - Existing timestamp, is_closed = 0 → UPDATE (open candle refresh or close)
-        - Existing timestamp, is_closed = 1 → SKIP  (closed candle is immutable)
+        - Existing timestamp, is_closed = FALSE → UPDATE (open candle refresh or close)
+        - Existing timestamp, is_closed = TRUE  → SKIP  (closed candle is immutable)
 
     Args:
-        conn      : open sqlite3.Connection from init_db()
+        conn      : open psycopg.Connection from get_connection()
         candles   : list of candle dicts
         exchange  : exchange identifier, e.g. 'binance'
         symbol    : unified symbol, e.g. 'BTC/USDT'
         timeframe : timeframe string, e.g. '5m'
 
     Returns:
-        Number of rows that were inserted or modified.
+        Total number of rows that were inserted or modified.
     """
     if not candles:
         return 0
 
-    rows = [
-        (
-            exchange,
-            symbol,
-            timeframe,
-            c["timestamp"],
-            c["open"],
-            c["high"],
-            c["low"],
-            c["close"],
-            c["volume"],
-            int(c["is_closed"]),  # ensure 0 or 1
-        )
-        for c in candles
-    ]
+    total_affected = 0
 
-    conn.executemany(_UPSERT_SQL, rows)
+    with conn.cursor() as cur:
+        for c in candles:
+            cur.execute(
+                _UPSERT_SQL,
+                (
+                    exchange,
+                    symbol,
+                    timeframe,
+                    c["timestamp"],
+                    c["open"],
+                    c["high"],
+                    c["low"],
+                    c["close"],
+                    c["volume"],
+                    bool(c["is_closed"]),  # int 0/1 → Python bool → PG BOOLEAN
+                ),
+            )
+            total_affected += cur.rowcount
+
     conn.commit()
-    return conn.total_changes
+    return total_affected
 
 
 def get_latest_timestamp(
-    conn: sqlite3.Connection,
+    conn: psycopg.Connection,
     exchange: str,
     symbol: str,
     timeframe: str,
@@ -162,7 +169,7 @@ def get_latest_timestamp(
     fetch only candles newer than this timestamp instead of the full history.
 
     Args:
-        conn      : open sqlite3.Connection
+        conn      : open psycopg.Connection
         exchange  : e.g. 'binance'
         symbol    : e.g. 'BTC/USDT'
         timeframe : e.g. '5m'
@@ -170,15 +177,17 @@ def get_latest_timestamp(
     Returns:
         Latest timestamp as int (ms), or None if table is empty for this market.
     """
-    cur = conn.execute(
-        """
-        SELECT MAX(timestamp)
-        FROM   ohlcv_5m
-        WHERE  exchange  = ?
-          AND  symbol    = ?
-          AND  timeframe = ?
-        """,
-        (exchange, symbol, timeframe),
-    )
-    row = cur.fetchone()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT MAX(timestamp)
+            FROM   ohlcv_5m
+            WHERE  exchange  = %s
+              AND  symbol    = %s
+              AND  timeframe = %s
+            """,
+            (exchange, symbol, timeframe),
+        )
+        row = cur.fetchone()
+
     return row[0] if row and row[0] is not None else None
