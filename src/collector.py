@@ -1,8 +1,8 @@
 """
-collector.py — Binance 5m BTC/USDT candle collector for CAA-2.
+collector.py — Binance 5m BTC/USDT candle collector for CAA-3.
 
 Flow:
-    1. Open (or create) local SQLite database via init_db()
+    1. Connect to Supabase PostgreSQL via get_connection()
     2. Read latest stored timestamp via get_latest_timestamp()
     3. Fetch candles from Binance Public REST API (incremental)
     4. Determine is_closed for each candle
@@ -13,6 +13,7 @@ Run:
     python src/collector.py
 
 No API key required — uses Binance public endpoint only.
+Requires DATABASE_URL in .env for Supabase connection.
 """
 
 import sys
@@ -24,7 +25,7 @@ import requests
 
 # Allow running as a script from any working directory
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.database import init_db, upsert_candles, get_latest_timestamp
+from src.database import get_connection, upsert_candles, get_latest_timestamp
 
 # ------------------------------------------------------------------
 # Constants
@@ -50,11 +51,8 @@ INITIAL_LIMIT = 200
 # 10 candles = 50 phút buffer — đủ cho prototype chạy mỗi 5m.
 INCREMENTAL_LIMIT = 10
 
-# Database location (bên trong db/, đã được .gitignore)
-DB_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "db", "local.db"
-)
+# Database target (Supabase PostgreSQL, connection via DATABASE_URL in .env)
+DB_TARGET = "Supabase PostgreSQL"
 
 # Binance API request timeout (giây)
 REQUEST_TIMEOUT = 10
@@ -163,8 +161,8 @@ def run_collector() -> dict:
     """
     now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
 
-    # --- Step 1: Initialise database ---
-    conn = init_db(DB_PATH)
+    # --- Step 1: Connect to Supabase PostgreSQL ---
+    conn = get_connection()
 
     # --- Step 2: Check latest stored timestamp ---
     latest_ts = get_latest_timestamp(conn, EXCHANGE, SYMBOL, TIMEFRAME)
@@ -199,15 +197,13 @@ def run_collector() -> dict:
     if not raw_klines:
         conn.close()
         return {"mode": mode, "fetched": 0, "upserted": 0,
-                "latest_ts": latest_ts, "db_path": DB_PATH}
+                "latest_ts": latest_ts, "db_target": DB_TARGET}
 
     # --- Step 5: Parse candles + determine is_closed ---
     candles = parse_candles(raw_klines, now_ms)
 
     # --- Step 6: Persist to database ---
-    before_changes = conn.total_changes
-    upsert_candles(conn, candles, EXCHANGE, SYMBOL, TIMEFRAME)
-    upserted = conn.total_changes - before_changes
+    upserted = upsert_candles(conn, candles, EXCHANGE, SYMBOL, TIMEFRAME)
 
     # --- Step 7: Read updated state ---
     new_latest_ts = get_latest_timestamp(conn, EXCHANGE, SYMBOL, TIMEFRAME)
@@ -228,7 +224,7 @@ def run_collector() -> dict:
         "latest_ts":      new_latest_ts,
         "latest_datetime": latest_datetime,
         "latest_status":  latest_status,
-        "db_path":        DB_PATH,
+        "db_target":      DB_TARGET,
     }
 
 
@@ -246,7 +242,7 @@ def print_summary(result: dict) -> None:
     print(f"  Latest ts   : {result['latest_ts']}")
     print(f"  Latest dt   : {result.get('latest_datetime', 'N/A')}")
     print(f"  Latest candle: {result.get('latest_status', 'N/A')}")
-    print(f"  DB path     : {result['db_path']}")
+    print(f"  DB target   : {result.get('db_target', 'N/A')}")
     print("=" * 55 + "\n")
 
 
